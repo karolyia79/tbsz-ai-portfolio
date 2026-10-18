@@ -1,0 +1,6 @@
+.env
+portfolio_db.json
+portfolio_log.csv
+venv/
+__pycache__/
+*.pyc
