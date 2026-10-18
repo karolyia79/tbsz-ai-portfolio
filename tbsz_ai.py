@@ -23,6 +23,19 @@ MONTH_NAMES = {
     9: "Szeptember", 10: "Október", 11: "November", 12: "December"
 }
 
+PAYMENT_SCHEDULE = {
+    "O": [1,2,3,4,5,6,7,8,9,10,11,12],
+    "STAG": [1,2,3,4,5,6,7,8,9,10,11,12],
+    "EPR": [1,2,3,4,5,6,7,8,9,10,11,12],
+    "MAIN": [1,2,3,4,5,6,7,8,9,10,11,12],
+    "MO": [1, 4, 7, 10],
+    "PEP": [1, 3, 6, 9],
+    "CVX": [3, 6, 9, 12],
+    "VZ": [2, 5, 8, 11],
+    "CCJ": [12],
+    "NVO": [4, 8]
+}
+
 print(f"=== 🚀 TBSZ AI BOT INDÍTÁSA (Modell: {MODEL_NAME}) ===")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -65,6 +78,16 @@ def save_portfolio_db(data):
 
 def get_current_holdings(db):
     holdings = {t: {"qty": 0.0, "total_cost_usd": 0.0, "avg_price_usd": 0.0} for t in TICKERS}
+    raw_h = db.get("holdings", {})
+    for t, val in raw_h.items():
+        if isinstance(val, dict):
+            q = float(val.get("qty", 0.0))
+            a = float(val.get("avg_price_usd", 0.0))
+        else:
+            q = float(val or 0.0)
+            a = 0.0
+        holdings[t] = {"qty": q, "total_cost_usd": q * a, "avg_price_usd": a}
+
     for tx in db.get("transactions", []):
         t = tx["ticker"]
         if t not in holdings:
@@ -212,6 +235,8 @@ def get_dividend_calendar(db, usd_huf, new_divs):
     txs = db.get("transactions", [])
     
     now = datetime.now()
+    curr_month_num = now.month
+    curr_month_name = MONTH_NAMES.get(curr_month_num, "")
     curr_month_str = now.strftime("%Y-%m")
     curr_year_str = now.strftime("%Y")
     
@@ -220,23 +245,90 @@ def get_dividend_calendar(db, usd_huf, new_divs):
     total_realized_huf = sum(tx.get("realized_profit_huf", 0.0) for tx in txs if tx.get("type") == "SELL")
     
     div_text = f"💵 **Szabad KP keret:** {cash_huf:,.0f} Ft (~${cash_usd:,.2f} USD)\n"
-    div_text += f"💰 **Ebben a hónapban beérkezett osztalék:** +{m_div_huf:,.0f} Ft\n"
+    div_text += f"💰 **{curr_month_name} hónapban jóváírt osztalék:** +{m_div_huf:,.0f} Ft\n"
     div_text += f"📅 **Idei ({curr_year_str}) összes osztalékbevétel:** +{y_div_huf:,.0f} Ft\n"
     div_text += f"📈 **Realizált Árfolyamnyereség:** {total_realized_huf:+,.0f} Ft\n\n"
     
     if new_divs:
-        div_text += "🎉 **ÚJONNAN JÓVÁÍRT OSZTALÉKOK:**\n" + "\n".join(new_divs) + "\n\n"
+        div_text += "🎉 **ÚJONNAN JÓVÁÍRT OSZTALÉKOK A MAI NAPON:**\n" + "\n".join(new_divs) + "\n\n"
 
-    total_annual_div_usd = 0.0
+    # 1. AKTUÁLIS HÓNAP OSZTALÉKAI
+    this_month_payers = []
+    this_month_expected_usd = 0.0
+    
     for t in TICKERS:
         qty = float(holdings.get(t, {}).get("qty", 0.0))
-        if qty > 0:
+        if curr_month_num in PAYMENT_SCHEDULE.get(t, []):
             try:
-                div_rate = yf.Ticker(t).info.get('dividendRate', 0) or 0
-                total_annual_div_usd += (div_rate * qty)
+                stock = yf.Ticker(t)
+                div_rate = stock.info.get('dividendRate', 0) or 0
+                
+                if t in ["O", "STAG", "EPR", "MAIN"]:
+                    payout_per_share = div_rate / 12.0
+                elif t in ["NVO"]:
+                    payout_per_share = div_rate / 2.0
+                elif t in ["CCJ"]:
+                    payout_per_share = div_rate
+                else:
+                    payout_per_share = div_rate / 4.0
+                    
+                total_payout_usd = payout_per_share * qty
+                this_month_expected_usd += total_payout_usd
+                
+                if qty > 0:
+                    this_month_payers.append(f"• **{t}** ({format_qty(qty)} db): **${total_payout_usd:.2f}** (~{total_payout_usd * usd_huf:,.0f} Ft)")
+                else:
+                    this_month_payers.append(f"• **{t}** (0 db): $0.00")
             except: pass
+
+    div_text += f"### 📅 {curr_month_name}i Várható Osztalékok\n"
+    if this_month_payers:
+        div_text += "\n".join(this_month_payers) + "\n"
+        div_text += f"**Összesen {curr_month_name}ban várható:** **${this_month_expected_usd:.2f}** (~{this_month_expected_usd * usd_huf:,.0f} Ft)\n\n"
+    else:
+        div_text += "Ebben a hónapban nincs ütemezett osztalékfizetés.\n\n"
+
+    # 2. ÉVES NAPTÁR ÉS ÜTEMEZÉS
+    havi, negyedeves, egyeb = [], [], []
+    total_annual_div_usd = 0.0
+    
+    for t in TICKERS:
+        qty = float(holdings.get(t, {}).get("qty", 0.0))
+        try:
+            stock = yf.Ticker(t)
+            info = stock.info
+            yield_pct = (info.get('dividendYield', 0) or 0) * 100
+            div_rate = info.get('dividendRate', 0) or 0
             
-    div_text += f"📊 **VÁRHATÓ ÉVES OSZTALÉK ÖSSZESEN:** ${total_annual_div_usd:,.2f} (~{total_annual_div_usd * usd_huf:,.0f} Ft/év)\n"
+            annual_payout_usd = div_rate * qty
+            total_annual_div_usd += annual_payout_usd
+            
+            detail = f"**{t}**: {yield_pct:.2f}%"
+            if qty > 0:
+                detail += f" | {format_qty(qty)} db -> **${annual_payout_usd:.2f}/év**"
+            
+            if t in ["O", "STAG", "EPR", "MAIN"]:
+                havi.append(f"{detail} (Havi)")
+            elif t in ["MO"]:
+                negyedeves.append(f"{detail} (Jan, Ápr, Júl, Okt)")
+            elif t in ["PEP"]:
+                negyedeves.append(f"{detail} (Jan, Már, Jún, Szep)")
+            elif t in ["CVX"]:
+                negyedeves.append(f"{detail} (Már, Jún, Szep, Dec)")
+            elif t in ["VZ"]:
+                negyedeves.append(f"{detail} (Feb, Máj, Aug, Nov)")
+            elif t in ["CCJ"]:
+                egyeb.append(f"{detail} (Évente - Dec)")
+            elif t in ["NVO"]:
+                egyeb.append(f"{detail} (Évi 2x - Ápr, Aug)")
+            else:
+                egyeb.append(detail)
+        except: pass
+
+    div_text += f"📊 **BECSÜLT ÉVES OSZTALÉK ÖSSZESEN:** ${total_annual_div_usd:,.2f} (~{total_annual_div_usd * usd_huf:,.0f} Ft/év)\n\n"
+    div_text += "### 🗓️ Havi fizetők\n" + "\n".join([f"- {x}" for x in havi]) + "\n\n"
+    div_text += "### 🗓️ Negyedéves fizetők\n" + "\n".join([f"- {x}" for x in negyedeves]) + "\n\n"
+    div_text += "### 🗓️ Egyéb fizetők\n" + "\n".join([f"- {x}" for x in egyeb])
     return div_text
 
 def generate_smart_report(market_data, db, usd_huf):
